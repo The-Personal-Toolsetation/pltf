@@ -18,6 +18,12 @@ def _c_symbol(value: str, suffix: str = '') -> str:
     return ''
   return value if value.endswith(suffix) or not suffix else f'{value}{suffix}'
 
+def _priority_macro(priority: str) -> str:
+  level = priority.removeprefix('LEVEL_')
+  if not level.isdigit() or not 0 <= int(level) <= 11:
+    raise ValueError(f"invalid task priority '{priority}', expected LEVEL_0..LEVEL_11")
+  return f'UEDP_TASK_PRI_LEVEL_{int(level)}'
+
 # DEPRECATED - _data_parts will be removed from section of actv-obj-post removal
 
 def _resolve_task_symbol(value: str, task_symbols: set[str]) -> str:
@@ -86,9 +92,19 @@ def build_appc_context(yaml_text: str) -> dict[str, Any]:
             'goto': transition['goto'],
             'goto_value': (
               f"({transition['goto']}_ID)" if transition['goto'] != 'UEDP_TSM_STATE_STAY' else f"({transition['goto']})"
-            )
+            ),
+            'action': (
+              f'{prefix}_trans_{transition_index}_func'
+              if transition.get('action') else None
+            ),
+            'action_body': (
+              _emit_action(transition['action'], task_symbols)
+              if transition.get('action') else None
+            ),
           }
-          for transition in state.get('trans', {}).get('trans', [])
+          for transition_index, transition in enumerate(
+            state.get('trans', {}).get('trans', [])
+          )
         ],
         'entry_actions': _emit_actions(_actions(state.get('on_ntry')), task_symbols),
         'active_actions': _emit_actions(_actions(state.get('on_actv')), task_symbols),
@@ -139,13 +155,13 @@ def build_appc_context(yaml_text: str) -> dict[str, Any]:
 
   context['tnorm_codegen'] = tnorm_codegen
   task_resource_items = []
-  # DEPRECATED - Old TASK - Forgot to add priority levels to the task resource items, add task for this
   for index, resource in enumerate(context['tnorm_resources']):
     logic = next((item for item in context['tnorm_logic'] if item['task'] == resource['id_symbol']), {})
     task = next((item for item in tnorm_codegen if item['task'] == resource['id_symbol']), {})
+    priority = logic.get('priority')
     task_resource_items.append({
       'id': resource['id_symbol'].removesuffix('_ID'),
-      'priority': f'UEDP_TASK_PRI_LEVEL_{max(0, 8 - index)}',
+      'priority': _priority_macro(priority) if priority else f'UEDP_TASK_PRI_LEVEL_{max(0, 8 - index)}',
       'handler': resource['handler'],
       'queue': resource['queue_name'],
       'fsm': f"&{resource['fsm_resrc']['kwobject'].lower()}" if logic.get('fsm') else 'NULL',
@@ -202,21 +218,11 @@ def build_appc_context(yaml_text: str) -> dict[str, Any]:
       f'{{ task_norm_t task_list[] = {{ {task_list} }}; uedp_msg_register_topic({entry["sig"]}, task_list); }}'
     )
   # CRITICAL - Find any task containing USR, as the initial message to start the user task
-  usr_task = next((task for task in tnorm_codegen if 'USR' in task['task']), None)
+  usr_task = next((task for task in tnorm_codegen if 'USR' or 'STR' in task['task']), None)
   if usr_task:
     context['init_actions'].append(
-      f'uedp_msg_t* start_msg = uedp_msg_alloc({usr_task["task"]}, SIG_STR, 0u);\n  if (start_msg) {{\n    uedp_task_norm_post_msg({usr_task["task"]}, start_msg); \n  }}'
+      f'uedp_msg_t* start_msg = uedp_msg_alloc({usr_task["task"]}, SIG_USR_START, 0u);\n  if (start_msg) {{\n    uedp_task_norm_post_msg({usr_task["task"]}, start_msg); \n  }}'
     )
-    for index, signal in enumerate(
-      ('SIG_TC_POS_03', 'SIG_TC_POS_04', 'SIG_TC_POS_05', 'SIG_TC_POS_06'),
-      start=1,
-    ):
-      context['init_actions'].append(
-        f'uedp_msg_t* testcase_msg_{index} = uedp_msg_alloc({usr_task["task"]}, {signal}, 0u);\n'
-        f'  if (testcase_msg_{index}) {{\n'
-        f'    uedp_task_norm_post_msg({usr_task["task"]}, testcase_msg_{index});\n'
-        '  }'
-      )
   return context
 
 def render_appc(yaml_text: str) -> str:
